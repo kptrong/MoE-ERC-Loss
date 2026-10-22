@@ -9,8 +9,10 @@ STEP 1 provides validated configuration and analytical parameter counts. STEP 2
 adds standalone RMSNorm, RoPE and causal self-attention in PyTorch. STEP 3 adds
 SwiGLU experts, a full-softmax Top-K router and sparse MoE dispatch. STEP 4 adds
 Pre-Norm decoder blocks, the complete tied-embedding LM, next-token cross entropy
-and synthetic forward/backward smoke tests. ERC, load-balancing loss, data loading
-and training remain future steps. There are no pretrained weights or dataset downloads.
+and synthetic forward/backward smoke tests. STEP 5 adds train-only byte-level BPE,
+Dolma/local streaming readers, resumable packing, memmapped datasets and data
+inspection CLIs. ERC, load-balancing loss and model training remain future steps.
+There are no pretrained weights or real dataset shards downloaded in verification.
 
 ## Architecture and budget
 
@@ -70,7 +72,21 @@ moe_erc/
   decoder.py            Pre-Norm attention/MoE block with both residuals
   model.py              Tied-embedding LM, input validation and shifted CE loss
   smoke_test.py         Full-size synthetic forward/backward CLI
+  dolma_reader.py       Manifest selection, bounded downloads and JSONL/gzip reader
+  tokenizer_utils.py    Stable document split and frozen train-only byte-level BPE
+  data_processing.py    Packing, shard checkpoints, fingerprints and integrity audit
+  dataset.py            Lazy uint16 memmap Dataset and seeded DataLoader
+  data_smoke.py         Offline data-to-model synthetic smoke test
+scripts/
+  inspect_dolma.py      Dry-run shard selection and optional explicit downloads
+  train_tokenizer.py    Train and save production/test tokenizer
+  prepare_dataset.py    Build or resume a packed corpus version
+  inspect_batch.py      Inspect/decode batches and optionally check the LM
+  _common.py            Shared source/CLI configuration and logging
+  __init__.py           Enables python -m scripts.<command> from repository root
 tests/
+  __init__.py            Offline test package
+  data_fixtures.py       Synthetic fixture helpers
   test_config.py        Defaults, validation and immutability tests
   test_parameter_count.py  Component totals and architecture sensitivity
   test_transformer_components.py  Numerical, causal, backward and CUDA tests
@@ -79,6 +95,11 @@ tests/
   test_moe.py            Sparse/dense comparison, dispatch, diagnostics and BF16
   test_decoder.py        Pre-Norm/residual structure and block gradients
   test_model.py          Full budget, tying, causal loss, validation and diagnostics
+  test_dolma_reader.py   Offline reader, mocked download and manifest tests
+  test_tokenizer.py      Train-only tokenizer, persistence and fingerprint tests
+  test_data_processing.py Packing reference, budgets, dedup and crash/resume tests
+  test_dataset.py        Memmap, workers, labels and data/model integration tests
+  test_data_cli.py       CLI help and no-download dry-run tests
 references/
   erc_paper.pdf          Existing primary methodology reference
 pyproject.toml          Package metadata, Python requirement and torch dependency
@@ -89,6 +110,8 @@ README.md               Scope, architecture and usage
 ## Environment setup
 
 Use Python 3.10 or newer and PyTorch 2.0 or newer (SDPA is required).
+STEP 5 also requires NumPy >=1.24 and Hugging Face tokenizers >=0.20,<1; all
+dependencies remain declared in pyproject.toml rather than a duplicate requirements file.
 In Colab select a GPU runtime and check the assigned
 device; the requested GPU is an A100. Colab commonly supplies PyTorch already.
 From the project root install the local package:
@@ -291,4 +314,202 @@ initialization, not quality measurements. CPU and CUDA generate random input on
 their own devices, so these two smoke losses are not a precision comparison.
 Unselected experts can legitimately have `None` gradients. Smoke scripts perform
 one backward pass without an optimizer or weight update. Execution on the target
-Colab A100 has not yet been verified. No STEP 5 work is included.
+Colab A100 has not yet been verified. These are the STEP 4 verification results.
+
+## STEP 5 data pipeline
+
+The public source is [allenai/dolma](https://huggingface.co/datasets/allenai/dolma),
+using the official [v1_5-sample URL manifest](https://huggingface.co/datasets/allenai/dolma/blob/main/urls/v1_5-sample.txt).
+This is the nearest public source chosen for the small experiment, not a claim
+that these are the exact shards used for the paper's `dolmap-v1.5-sample` runs.
+The word "sample" does not imply a small download. No real shards were downloaded
+or processed for STEP 5 verification.
+
+The pipeline is:
+
+```text
+frozen manifest/subset -> local compressed shards -> document SHA-256 split
+  -> train-only BPE sample (train once)
+  -> frozen BPE + EOS per document -> independent train/validation token streams
+  -> 512-token sequences -> little-endian uint16 binary segments
+  -> memory mapping -> torch.long input_ids and cloned labels -> LM causal shift
+```
+
+Raw shard acquisition is opt-in. Gzip shards are cached compressed, then read
+line by line using `gzip.open(..., 'rt')`; they are never fully decompressed into
+RAM. Local `.jsonl` and `.json.gz` files use the same document reader. Malformed
+JSON, missing/non-string text and empty documents are counted and skipped; corrupt
+gzip or unreadable files fail explicitly. Raw source checksums are computed in
+bounded chunks. One document and its token IDs may be resident at a time.
+
+### Frozen source and split policy
+
+Selection sorts unique manifest URLs, shuffles them with the supplied seed and
+takes at most `--max-shards`. `--source-contains` filters URL paths explicitly;
+this is not stratified sampling or a promise of the full Dolma source mixture.
+Do not assume the first few shards represent the corpus distribution. Selected
+URLs, selection seed, manifest source and SHA-256 are saved in a new selection
+JSON; existing selections are not overwritten.
+
+Each text has CRLF/CR normalized to LF and outer whitespace stripped. Its UTF-8
+SHA-256 defines content identity. The split hashes `seed:content_sha256` with
+SHA-256 and compares against the validation fraction (default 0.01). Split occurs
+before tokenization. Identical canonical content always belongs to one split,
+even with different document IDs; an on-disk SQLite ledger deduplicates it across
+shards. This is exact canonical-content deduplication, not fuzzy near-deduplication.
+`audit_document_splits()` checks ledger assignments without loading all hashes
+into RAM. Empty validation is reported and never filled with training documents.
+
+Use the same source order, split seed/fraction, tokenizer and validation budget
+for Vanilla and ERC experiments. Train and validation caps are independent;
+processing continues past the train cap to fill validation. If sources are
+exhausted, metadata reports actual counts and `budget_reached=False`. Freeze an
+adequately filled validation corpus before comparisons; changing the source plan
+while validation is still short can change that incomplete validation corpus.
+
+### Tokenizer policy
+
+The tokenizer is a [Hugging Face tokenizers byte-level BPE trained from an iterator](https://huggingface.co/docs/tokenizers/training_from_memory).
+It uses all 256 byte symbols, no prefix space, minimum merge frequency 2, and
+special tokens `<pad>`, `<bos>`, `<eos>`, `<unk>` (IDs recorded explicitly, 0-3).
+The first `--max-documents` unique **training** documents in the frozen source
+order form the fixed training sample. Validation text is never passed to BPE.
+SQLite keeps deduplication out of RAM; the BPE trainer itself still needs memory
+for its vocabulary/merge statistics. Training-sample content fingerprint, consumed
+source checksums, trainer settings and tokenizers version are saved alongside JSON.
+
+Production requires an actual vocabulary of exactly **16000 including specials**;
+if the corpus cannot produce that vocabulary, training fails without pretending
+it reached 16000. A small fixture can use `--test-only --vocab-size 320`, explicitly
+marked in metadata; preprocessing must then opt in with `--allow-test-tokenizer`.
+Model compatibility requires exact vocabulary agreement. The saved wrapper offers
+encode/decode only, with no add-token or retraining API. Existing tokenizer paths
+are not overwritten. Train production once, preserve JSON plus `.meta.json`,
+and reuse them for every data budget and model variant.
+
+### Packing, storage and resume
+
+Budgets count actual encoded IDs **including appended EOS**, not characters or
+words. At a cap, the last encoded document can be truncated (so its appended EOS
+may fall outside the retained prefix). Separate split buffers carry tails across
+shards; only the final incomplete sequence is discarded. Metadata separates
+encoded, accepted, packed, budget-discarded and tail-discarded tokens. Documents
+skipped after a split reaches its cap are counted separately and are not tokenized;
+no token count is guessed for their unencoded text. A token cap not divisible by
+512 produces fewer packed tokens than the cap, reported exactly.
+
+Packed samples contain no padding or BOS. EOS separates documents, and **causal
+attention can cross earlier document boundaries inside a sequence**; there is no
+document-boundary mask. Dataset samples return `labels = input_ids.clone()` with
+no shift. The model alone shifts once; a full 512-token sequence supplies 511
+target positions. Neither Dataset nor DataLoader transfers the corpus to GPU.
+
+Each committed shard produces separate train/validation binary segments and a
+checkpoint containing carry buffers, counts, content fingerprints and source
+checksums. SQLite rows have shard indices. After interruption, `--resume` removes
+uncheckpointed ledger rows and rebuilds that shard's orphaned segment files, so
+sequences are not appended twice. Only committed shard work is reused; there is
+no mid-shard or partial-HTTP-transfer resume. Keep the raw sources/cache, tokenizer,
+`documents.sqlite`, segments and checkpoint. Use one preprocessing writer per
+output directory. Resume rejects changes to the source plan, tokenizer or config.
+
+`dataset.json` is published only after completion. It includes the source
+provenance, split algorithm/config, tokenizer and corpus fingerprints, actual
+processed shards, counts, segment SHA-256/byte lengths, packing config and runtime
+versions. Files use `<u2` and become copied `torch.long` tensors on sampling.
+Readers validate sizes/metadata; `--verify-checksums` additionally scans binary
+checksums and token ranges. Existing dataset directories are refused unless
+`--resume` is supplied. To increase the train budget, create a new corpus version
+with the same frozen tokenizer and validation configuration; no tokenizer retraining
+is needed. Old versions remain intact. Large artifacts under `data/`, checkpoints
+and runs are ignored by Git.
+
+### CLI examples (run manually from the repository root)
+
+All four commands support `--help` and Windows/Linux. Inspection defaults to
+dry-run: manifest requests and optional HEAD requests only, no shard bodies.
+Unknown/missing Content-Length is printed as `unknown`; it is never estimated.
+
+```bash
+python -m scripts.inspect_dolma --max-shards 1 --seed 42 --check-size --save-selection data/debug-selection.json
+```
+
+Review the URLs and sizes before explicitly permitting shard downloads. The
+following commands **have not been executed on real Dolma**. The byte limit bounds
+compressed bytes received per invocation, including failed attempts; cached files
+are verified and reused. Unknown-length responses are stopped if the limit is
+exceeded. A single compressed shard may exceed this example limit and will then
+be refused. Retry count and timeout are configurable on the source CLIs.
+
+```bash
+python -m scripts.train_tokenizer --selection data/debug-selection.json --allow-download --max-download-bytes 2000000000 --output data/tokenizer/production.json --max-documents 20000
+python -m scripts.prepare_dataset --selection data/debug-selection.json --allow-download --max-download-bytes 2000000000 --tokenizer data/tokenizer/production.json --output-dir data/processed/debug --train-max-tokens 1000000 --validation-max-tokens 100000
+python -m scripts.inspect_batch --dataset data/processed/debug --tokenizer data/tokenizer/production.json --batch-size 1 --verify-checksums --decode --model-check
+```
+
+If tokenizer training reports insufficient vocabulary, supply a larger fixed
+training sample before freezing production. A new run needs a new tokenizer path;
+never replace the tokenizer used by an existing corpus. For already-local shards,
+replace `--selection ... --allow-download ...` with `--inputs path/a.json.gz path/b.jsonl`.
+Source order and split options must match across tokenizer and corpus creation.
+For a clean pause use `--max-shards-per-run 1`; repeat the identical prepare command
+with `--resume` to continue. Increase the download limit only after reviewing sizes.
+
+Suggested experimental caps below are project choices, not paper-validated 52M
+training scales. Freeze one adequately large source plan and one 16K tokenizer
+for the comparison runs. Use a new output directory for each corpus version.
+
+| Experiment | --train-max-tokens | --validation-max-tokens | Example output |
+| --- | ---: | ---: | --- |
+| Debug | 1000000 to 5000000 | 100000 | data/processed/debug |
+| Pilot | 50000000 | 1000000 | data/processed/pilot-50m |
+| Main | 200000000 | 1000000 | data/processed/main-200m |
+| Extended | 500000000 | 1000000 | data/processed/extended-500m |
+
+For example (not executed):
+
+```bash
+python -m scripts.prepare_dataset --selection data/frozen-selection.json --allow-download --tokenizer data/tokenizer/production.json --output-dir data/processed/pilot-50m --train-max-tokens 50000000 --validation-max-tokens 1000000 --seed 42
+```
+
+For Main/Extended change the train cap and output directory only. Supply an
+appropriate reviewed download limit if more compressed shards are needed.
+Validation DataLoaders never shuffle; training uses a seeded torch.Generator.
+Use `num_workers=0` on Windows for debugging, or multiple workers on Linux/Colab.
+Two-worker loading and spawned/pickled lazy memmaps are also tested on Windows.
+Gradient accumulation can consume these ordinary CPU batches in STEP 6; no
+optimizer or model training loop exists in STEP 5.
+
+### Offline verification
+
+```bash
+python -m unittest discover -s tests -v
+python -m moe_erc.data_smoke
+```
+
+To retain synthetic artifacts for inspection, use a fresh path:
+
+```bash
+python -m moe_erc.data_smoke --output-dir data/offline-smoke
+python -m scripts.inspect_batch --dataset data/offline-smoke/packed --tokenizer data/offline-smoke/tokenizer.json --batch-size 2 --verify-checksums --tiny-model
+```
+
+The synthetic smoke fixture deliberately searches for documents already assigned
+to each split; it does not reassign training data or represent Dolma proportions.
+It trains a **test-only 320-token vocabulary**, packs real 512-token sequences and
+uses a small instance of the unchanged LM implementation. The production 52M
+architecture remains unchanged.
+
+STEP 5 verification on 2026-10-23 in `ml_env`: **83 tests passed, 0 failed,
+0 skipped**, including prior CUDA/BF16 tests, Windows two-worker DataLoader,
+sparse/dense tests, source budgets and simulated shard-commit crash recovery.
+The full suite used `torch.set_num_threads(2)` as in STEP 4. Added dependencies
+were installed with approval; tokenizers version is 0.23.3. All data tests are
+offline and remote transfers are mocked.
+
+Standalone offline smoke: input IDs and labels `[2,512]`, both `torch.int64`,
+unshifted identical values, token range `[15,319]`; logits `[2,512,320]`, finite
+loss **16.337498**, backward **PASS**, no split overlap. Packed counts were
+4096 train and 2048 validation tokens. No 16K production tokenizer, real Dolma
+transfer, 50M/200M/500M corpus, Colab throughput or A100 data run is claimed as
+verified here. No STEP 6 work was performed.

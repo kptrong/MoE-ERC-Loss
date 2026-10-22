@@ -5,3 +5,10 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+data/
+checkpoints/
+runs/
+*.bin
+*.sqlite
+*.sqlite-journal
+*.part
