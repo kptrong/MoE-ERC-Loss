@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .config import ModelConfig
+from .aoe import AoEDecoderBlock
 from .decoder import MoEDecoderBlock
 from .moe import RoutingDiagnostics
 from .rmsnorm import RMSNorm
@@ -39,11 +40,13 @@ class MoELanguageModel(nn.Module):
     padding mask, KV cache or extra positional parameters are introduced.
     """
 
+    decoder_block_cls = MoEDecoderBlock
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.layers = nn.ModuleList(MoEDecoderBlock(config) for _ in range(config.n_layers))
+        self.layers = nn.ModuleList(self.decoder_block_cls(config) for _ in range(config.n_layers))
         self.final_norm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         # Share the actual Parameter, not a one-time copy of its values.
@@ -105,3 +108,13 @@ class MoELanguageModel(nn.Module):
             logits=logits, loss=loss,
             routing_info=tuple(routing_info) if routing_info is not None else None,
         )
+
+
+class AoELanguageModel(MoELanguageModel):
+    """AoE blocks with the exact shared embedding, validation and causal CE API.
+
+    layer.moe is the common FFN slot and contains SparseAoE, with no router.
+    Opt-in diagnostics additionally include full norm scores/probabilities.
+    """
+
+    decoder_block_cls = AoEDecoderBlock

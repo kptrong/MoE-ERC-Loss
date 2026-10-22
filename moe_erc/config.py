@@ -77,3 +77,15 @@ class ModelConfig:
     def to_dict(self) -> dict:
         """Return serializable settings suitable for an experiment record."""
         return {field.name: getattr(self, field.name) for field in fields(self)}
+
+
+@dataclass(frozen=True)
+class AoEConfig(ModelConfig):
+    """Separate AoE settings; Vanilla ModelConfig defaults remain unchanged."""
+
+    aoe_rank: int = 171
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if type(self.aoe_rank) is not int or self.aoe_rank <= 0:
+            raise ValueError("aoe_rank must be a positive integer")

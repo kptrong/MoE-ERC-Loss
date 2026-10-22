@@ -12,6 +12,8 @@ Pre-Norm decoder blocks, the complete tied-embedding LM, next-token cross entrop
 and synthetic forward/backward smoke tests. STEP 5 adds train-only byte-level BPE,
 Dolma/local streaming readers, resumable packing, memmapped datasets and data
 inspection CLIs. ERC, load-balancing loss and model training remain future steps.
+STEP 5A adds a separate Autonomy-of-Experts baseline with factorized gate
+projections and norm-based routing, using the same decoder/LM forward and data pipeline.
 There are no pretrained weights or real dataset shards downloaded in verification.
 
 ## Architecture and budget
@@ -77,11 +79,15 @@ moe_erc/
   data_processing.py    Packing, shard checkpoints, fingerprints and integrity audit
   dataset.py            Lazy uint16 memmap Dataset and seeded DataLoader
   data_smoke.py         Offline data-to-model synthetic smoke test
+  aoe_expert.py         Factorized SwiGLU expert with reusable gate-down activation
+  aoe.py                Sparse AoE, norm routing, diagnostics and AoE decoder subclass
+  model_factory.py      Select vanilla_moe or aoe without a new ERC architecture
 scripts/
   inspect_dolma.py      Dry-run shard selection and optional explicit downloads
   train_tokenizer.py    Train and save production/test tokenizer
   prepare_dataset.py    Build or resume a packed corpus version
   inspect_batch.py      Inspect/decode batches and optionally check the LM
+  smoke_test_aoe.py      Same-batch Vanilla/AoE full-size forward/backward checks
   _common.py            Shared source/CLI configuration and logging
   __init__.py           Enables python -m scripts.<command> from repository root
 tests/
@@ -100,6 +106,10 @@ tests/
   test_data_processing.py Packing reference, budgets, dedup and crash/resume tests
   test_dataset.py        Memmap, workers, labels and data/model integration tests
   test_data_cli.py       CLI help and no-download dry-run tests
+  test_aoe_expert.py     Factorized gate, rank validation and cached-z tests
+  test_aoe.py            Norm routing, sparse/dense gradients and BF16 tests
+  test_aoe_model.py      Full AoE budget, causal loss and independent layers
+  test_model_factory.py Factory, both state_dict round trips and data-to-AoE batch
 references/
   erc_paper.pdf          Existing primary methodology reference
 pyproject.toml          Package metadata, Python requirement and torch dependency
@@ -513,3 +523,130 @@ loss **16.337498**, backward **PASS**, no split overlap. Packed counts were
 4096 train and 2048 validation tokens. No 16K production tokenizer, real Dolma
 transfer, 50M/200M/500M corpus, Colab throughput or A100 data run is claimed as
 verified here. No STEP 6 work was performed.
+
+## STEP 5A Autonomy-of-Experts baseline
+
+The implementation follows Section 2/Figure 2, Section 4.1 and Appendix C.1 of
+`references/erc_paper.pdf`. AoE replaces the independent linear router with
+expert-derived activation norms; ERC remains a future auxiliary loss on Vanilla
+MoE, not an architecture alias for AoE.
+
+For each expert, gate projection W_g is factorized into `gate_down_proj: d -> r`
+and `gate_up_proj: r -> D`. The separate SwiGLU `up_proj: d -> D` and final
+`down_proj: D -> d` retain their roles:
+
+```text
+z_i = gate_down_proj_i(x)
+scores_i = L2_norm(z_i)                 # before SiLU, for ALL experts
+p = softmax(scores over ALL experts)
+selected weights, indices = TopK(p)    # no Top-K renormalization
+E_i(x, z_i) = down_proj_i(silu(gate_up_proj_i(z_i)) * up_proj_i(x))
+y = sum(p_i * E_i(x, cached_z_i) for selected i)
+```
+
+All experts compute gate-down exactly once per forward. Only the selected experts
+execute gate-up, SwiGLU up and output projections. The cached gate-down activation
+is reused for selected tokens without detaching. Unselected experts can still
+receive gate-down gradients through full-softmax probabilities; their remaining
+projections are not executed and can have None gradients. There is no independent
+learned router, random routing, capacity limit or token dropping. No ERC or
+load-balancing loss is applied.
+
+### Configuration and shared interfaces
+
+`ModelConfig` remains unchanged. `AoEConfig(ModelConfig)` adds validated positive
+integer `aoe_rank=171`. The paper's 3B setup uses d=1536, D=768, r=512; our scaled
+choice comes from rounding d*D/(d+D)=170.666... to 171 at d=512,D=256. No other
+width, depth or vocabulary is adjusted to force equal counts. The small tests
+set their own explicit ranks; the full-size architecture always uses r=171.
+
+```python
+from moe_erc import ModelConfig, AoEConfig, count_parameters
+from moe_erc.model_factory import create_model
+
+vanilla = create_model("vanilla_moe", ModelConfig())
+aoe = create_model("aoe", AoEConfig())
+aoe_budget = count_parameters(AoEConfig(), model_type="aoe")
+# create_model("aoe", ModelConfig()) also preserves all base settings and adds r=171.
+logits = aoe(input_ids)
+result = aoe(input_ids, labels=labels, return_routing_info=True)
+result.loss.backward()
+scores = result.routing_info[0].diagnostics.scores  # [B,T,16], detached logging data
+```
+
+`AoEDecoderBlock` inherits the existing block forward; `AoELanguageModel` inherits
+the existing model forward, input validation, tied embedding and shifted FP32 CE.
+Two class-level construction hooks select the FFN layer and decoder class without
+duplicating Attention, RMSNorm, RoPE, residual arithmetic or LM loss. The existing
+`layer.moe` attribute is the common FFN slot: it holds SparseMoE in Vanilla and
+SparseAoE in AoE. The Vanilla routing implementation and Data Pipeline files are
+unchanged. Both architectures support state_dict save/load with tied weights.
+
+`SparseAoE.compute_routing(flat)` exposes attached activations `[N,16,171]`, scores,
+probabilities, Top-K indices and weights. Norms and softmax use FP32 for low-precision
+activations, preserving FP64 for reference tests. Selected-output accumulation
+follows the existing FP32 low-precision policy, with the output cast to input dtype.
+
+Diagnostics are opt-in and per layer. AoE returns the existing counts, assignment
+fractions, mean probabilities and Top-K indices plus full `scores`, full
+`probabilities` and `mean_activation_norms`. Every logging tensor is detached;
+the activations/weights used for forward are not. Full scores/probabilities can
+be large, so they are never retained as module attributes or returned by default.
+Assignment fractions divide counts by N*K. Mean probabilities/norms are per expert.
+
+### Analytical and actual parameter budgets
+
+| Component | Vanilla MoE | AoE (r=171) |
+| --- | ---: | ---: |
+| One expert | 393,216 | 393,472 |
+| Expert parameters per layer | 6,291,456 | 6,295,552 |
+| Independent router per layer | 8,192 | 0 |
+| Complete expert layer | 6,299,648 | 6,295,552 |
+| Six expert layers | 37,797,888 | 37,773,312 |
+| Complete tied-embedding LM | **52,288,000** | **52,263,424** |
+
+The four AoE matrices contribute 87,552 + 43,776 + 131,072 + 131,072 per expert.
+Rounding r adds 256 parameters per expert compared with Vanilla; removing six
+linear routers saves 49,152, so AoE is **24,576 parameters smaller** overall.
+`ParameterCounts.swiglu_experts` includes the factorized gate in AoE; its existing
+field name is preserved for compatibility. Tied embeddings are counted once.
+
+```bash
+python -m moe_erc                       # Vanilla, unchanged default
+python -m moe_erc --model-type aoe
+python -m scripts.smoke_test_aoe
+python -m scripts.smoke_test_aoe --device cuda --bf16
+```
+
+AoE's additional gate-down work scales with token count in training and inference.
+At equal token budgets, compute costs differ. Appendix C.1's general extra FFN
+FLOPs expression is T*(2*n*d*r + 2*K*D*r - 2*K*D*d). Its simplified expression
+2*T*(n-K)*d*r assumes exact parameter-preserving r; rounding to 171 introduces
+a small discrepancy, so the exact rounded-r expression should be used for future
+compute accounting. Neither expression is a measured throughput result.
+
+Future comparisons must freeze tokenizer/corpus/validation, context, base model
+dimensions and evaluation tooling, then control optimizer, schedule, seeds and
+token budget. Quality at equal tokens and efficiency at equal compute are separate
+evaluations. No speed or quality advantage is inferred from untrained smoke losses.
+
+### Verification (2026-10-23)
+
+Final full STEP 1-5A suite: **101 passed, 0 failed, 0 errors, 0 skipped**
+(18 added test methods). Subtest counts are not separately reported by the runner.
+Both full-size parameter counts match PyTorch actual counts. CPU and CUDA/BF16
+comparison smoke tests pass on the local RTX 4050 Laptop GPU with PyTorch
+2.11.0+cu128; both variants use the same `[1,16]` IDs within each invocation and
+return logits `[1,16,16000]`, finite CE and finite backward gradients. They print
+per-layer selection counts and basic activation/probability statistics. CPU losses
+were 473.166870 (Vanilla) and 472.301270 (AoE); CUDA/BF16 losses were 477.190094
+and 480.352875. These are technical sanity results on random initialization only.
+
+The suite covers factorization, no post-Top-K renormalization, pre-SiLU norms,
+all-expert routing gradients, selected-only continuation, single tokens and empty
+experts, gate-down reuse, sparse/dense output and gradient equality, zero-norm
+stability, causal LM behavior, independent blocks, BF16, factory selection and
+both state_dict round trips. An additional test reads a STEP 5 memmapped batch
+into AoE and completes backward. Target A100 execution, throughput, memory scaling
+and trained-model quality remain unverified. No Dolma shards were downloaded,
+no model weights were trained, and no STEP 6 implementation was added.

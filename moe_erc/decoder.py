@@ -12,12 +12,14 @@ from .rmsnorm import RMSNorm
 class MoEDecoderBlock(nn.Module):
     """x + attention(norm_1(x)), then h + moe(norm_2(h))."""
 
+    expert_layer_cls = SparseMoE
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.norm_1 = RMSNorm(config.d_model, config.rms_norm_eps)
         self.attention = CausalSelfAttention(config)
         self.norm_2 = RMSNorm(config.d_model, config.rms_norm_eps)
-        self.moe = SparseMoE(config)
+        self.moe = self.expert_layer_cls(config)
 
     def forward(
         self, x: torch.Tensor, *, return_routing_info: bool = False,
