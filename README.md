@@ -305,6 +305,37 @@ zero, including a valid backward pass.
 probabilities are provided rather than full per-token probabilities/logits.
 Diagnostics are allocated only on request and never stored on the model.
 
+### Shared embedding initialization
+
+The base `MoELanguageModel` explicitly initializes the tied token embedding/LM
+head once with `Normal(0, 0.02)` after constructing all sublayers. Vanilla MoE
+and AoE inherit this same initialization. The change leaves every other Linear
+initialization, RMSNorm scale, routing rule, loss, and parameter count unchanged.
+The previous PyTorch embedding default, `Normal(0, 1)`, produced excessive
+current-token logits through the tied head and residual path. The value 0.02 is
+a starting point supported by the project's controlled diagnosis, not a claim
+of an optimal pretraining recipe or an initial CE exactly equal to `log(vocab)`.
+
+Loading a saved `state_dict` still restores its embedding weights; this change
+does not migrate old checkpoints. Record the new source revision for new runs
+and share the exact initial state between Vanilla and Vanilla+ERC comparisons.
+Existing immutable dataset metadata may record the old `model.py` checksum;
+version compatibility checks should acknowledge this source-only change without
+rewriting the dataset, tokenizer, or pilot manifest.
+
+### Initialization fix verified locally on 2026-10-25
+
+Conda `ml_env`, PyTorch 2.11.0+cu128, RTX 4050 Laptop GPU (6 GB): all 106 tests
+passed, including five new initialization regression tests with CPU seeds
+0/42/123 and full-size CUDA FP32/BF16 forward/backward at seeds 42/123. The first
+full-suite attempt hit Windows sandbox temporary-directory permissions; the
+unrestricted rerun passed without changing or skipping tests.
+
+On the same synthetic `[2,512]` input at initialization seed 42, FP32 CE changed
+from 507.6711 to 9.7816 for Vanilla and from 508.1234 to 9.7874 for AoE. Fixed
+BF16 CE was 9.7817 and 9.7873 respectively. These are initialization sanity
+measurements, not language-model quality results or target Colab A100 results.
+
 ### Verified locally on 2026-10-23
 
 Environment: Conda `ml_env`, Python 3.11.16, PyTorch 2.11.0+cu128, NVIDIA GeForce
@@ -322,6 +353,7 @@ RTX 4050 Laptop GPU (6 GB), driver 582.05. No package installation was needed.
 The loss numbers are sanity checks on random IDs with default random PyTorch
 initialization, not quality measurements. CPU and CUDA generate random input on
 their own devices, so these two smoke losses are not a precision comparison.
+These historical loss values precede the shared embedding initialization fix.
 Unselected experts can legitimately have `None` gradients. Smoke scripts perform
 one backward pass without an optimizer or weight update. Execution on the target
 Colab A100 has not yet been verified. These are the STEP 4 verification results.

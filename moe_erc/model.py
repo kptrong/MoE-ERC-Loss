@@ -51,6 +51,11 @@ class MoELanguageModel(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         # Share the actual Parameter, not a one-time copy of its values.
         self.lm_head.weight = self.token_embedding.weight
+        # Initialize the shared parameter once, after building all sublayers so
+        # their existing Linear/RMSNorm initialization stays unchanged. The
+        # Embedding default N(0, 1) otherwise gives the tied head excessive scale.
+        # 0.02 is a diagnosed starting point, not an optimal pretraining recipe.
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
 
     def _validate_inputs(self, input_ids: torch.Tensor, labels: torch.Tensor | None) -> None:
         if input_ids.ndim != 2 or input_ids.shape[0] == 0:
