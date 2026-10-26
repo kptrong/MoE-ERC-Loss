@@ -89,3 +89,50 @@ class AoEConfig(ModelConfig):
         super().__post_init__()
         if type(self.aoe_rank) is not int or self.aoe_rank <= 0:
             raise ValueError("aoe_rank must be a positive integer")
+
+
+@dataclass(frozen=True)
+class ERCConfig:
+    """Auxiliary training policy, deliberately separate from model architecture.
+
+    Mean over layers and once-per-optimizer-step noise are project decisions.
+    algorithm_version pins the Figure 8 stop-gradient and clamp semantics.
+    """
+
+    enabled: bool = False
+    alpha: float = 1.0
+    coefficient: float = 1.0
+    layer_reduction: str = "mean"
+    noise_timing: str = "once_per_optimizer_step"
+    algorithm_version: str = "erc-figure8-stopgrad-v1"
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("ERC enabled must be bool")
+        for name in ("alpha", "coefficient"):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)):
+                raise ValueError(f"ERC {name} must be a finite real number")
+        if not 0 <= self.alpha <= 1:
+            raise ValueError("ERC alpha must be in [0,1]")
+        if self.coefficient < 0:
+            raise ValueError("ERC coefficient must be nonnegative")
+        expected = {
+            "layer_reduction": "mean",
+            "noise_timing": "once_per_optimizer_step",
+            "algorithm_version": "erc-figure8-stopgrad-v1",
+        }
+        for name, value in expected.items():
+            if getattr(self, name) != value:
+                raise ValueError(f"ERC {name} must be {value!r}")
+
+    def to_dict(self) -> dict:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "ERCConfig":
+        """Strict checkpoint decoding: missing/unknown fields are not defaults."""
+        if not isinstance(value, dict) or set(value) != {field.name for field in fields(cls)}:
+            raise ValueError("ERC checkpoint config fields do not match the schema")
+        return cls(**value)

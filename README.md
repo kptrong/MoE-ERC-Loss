@@ -11,7 +11,10 @@ SwiGLU experts, a full-softmax Top-K router and sparse MoE dispatch. STEP 4 adds
 Pre-Norm decoder blocks, the complete tied-embedding LM, next-token cross entropy
 and synthetic forward/backward smoke tests. STEP 5 adds train-only byte-level BPE,
 Dolma/local streaming readers, resumable packing, memmapped datasets and data
-inspection CLIs. ERC, load-balancing loss and model training remain future steps.
+inspection CLIs. STEP 7.2 adds the ERC mathematical core; STEP 7.3 adds a small
+update-boundary adapter for the existing Colab training helpers. The tested
+CE/load-balancing training loop and full Drive checkpoints remain notebook code,
+not a new training framework in this repository.
 STEP 5A adds a separate Autonomy-of-Experts baseline with factorized gate
 projections and norm-based routing, using the same decoder/LM forward and data pipeline.
 There are no pretrained weights or real dataset shards downloaded in verification.
@@ -682,3 +685,111 @@ both state_dict round trips. An additional test reads a STEP 5 memmapped batch
 into AoE and completes backward. Target A100 execution, throughput, memory scaling
 and trained-model quality remain unverified. No Dolma shards were downloaded,
 no model weights were trained, and no STEP 6 implementation was added.
+
+## STEP 7.3: optional ERC at the optimizer-update boundary
+
+`ERCConfig` in `moe_erc.config` is separate from `ModelConfig`/`AoEConfig`.
+Defaults are `enabled=False`, `alpha=1.0`, `coefficient=1.0`,
+`layer_reduction="mean"`, `noise_timing="once_per_optimizer_step"`, and
+`algorithm_version="erc-figure8-stopgrad-v1"`. Mean reduction and sampling once
+per optimizer update are **project policies**, not verified author settings.
+Alpha must be in [0,1] and the coefficient must be finite and nonnegative.
+
+`compute_model_erc(model, config)` in `moe_erc.erc_training` uses the existing
+layer routers and `get_gate_weights()`, calling the STEP 7.2 FP32 ERC core.
+It returns attached `raw_loss`/`weighted_loss` and detached Python `metrics`.
+The core follows Figure 8: proxy generation is entirely under `no_grad` and the
+hinges use `clamp(min=0)`, including its subgradient at zero. ERC-only gradients
+reach gate weights, not the router/up/output projections. The router still
+receives its normal CE/LB gradients. No parameters or model state-dict keys are
+added; the existing CE-only `LanguageModelOutput.loss` is unchanged.
+
+Disabled ERC or coefficient zero skips ERC computation and noise entirely.
+Evaluation also skips it. Normal model forward never invokes this helper, so
+inference incurs no added ERC computation. AoE with `enabled=True` is explicitly
+rejected, including with coefficient zero; use `ERCConfig()` for the AoE baseline.
+
+### Minimal change to the existing notebook loop
+
+Keep `rt_compute_loss`, the target-weighted microbatch backwards, optimizer and
+scheduler construction, and data loading unchanged. Replace the old final
+clip/optimizer/scheduler block with `finish_optimizer_step` **once per update**.
+Do not call both the old block and the adapter. The following is a call-site
+example for the existing notebook helpers, not a standalone training script:
+
+```python
+from moe_erc.config import ERCConfig
+from moe_erc.erc_training import finish_optimizer_step
+
+erc_config = ERCConfig(enabled=True, alpha=1.0, coefficient=1.0)
+optimizer.zero_grad(set_to_none=True)
+targets = [int((b["labels"][:, 1:] != -100).sum()) for b in batches]
+total_targets = sum(targets)
+totals = {"ce": 0.0, "lb_raw": 0.0, "lb_weighted": 0.0}
+for batch_cpu, n_targets in zip(batches, targets):
+    batch_gpu = {name: value.to(RT_DEVICE) for name, value in batch_cpu.items()}
+    losses = rt_compute_loss(model, kind, batch_gpu, bf16=True)
+    q = n_targets / total_targets
+    (q * losses["total"]).backward()  # Existing CE + 0.01 * LB only.
+    for key in totals:
+        totals[key] += q * float(losses[key].detach())
+    # Keep the existing active-expert bookkeeping/gradient checks here.
+    del losses, batch_gpu
+
+metrics = finish_optimizer_step(
+    model, erc_config, optimizer, scheduler,
+    **totals, global_step=step - 1, effective_targets=total_targets,
+    clip_norm=RT_CFG.clip_norm,
+)
+# On success only: commit step/data-cursor/input-token/target counters using the
+# existing notebook logic. Preserve its other return fields, including `step`.
+```
+
+For Vanilla/AoE baselines pass `ERCConfig()`. In all cases the adapter assumes
+nonempty, already-backpropagated data losses and a training-mode model. It never
+loads data or calls `zero_grad`. It requires the optimizer to contain every
+trainable model parameter exactly once, and checks the Step 6 scheduler convention
+(`last_epoch == completed global_step`, then one scheduler step after update).
+
+For `q_m = targets_m / sum(targets)`, its gradients correspond to:
+
+`sum_m q_m * (CE_m + 0.01 * LB_m) + coefficient * mean_layers(ERC_layer)`.
+
+ERC is evaluated/backpropagated after all data backwards and before clipping,
+with no multiplication or division by the accumulation count. Logs contain CE,
+LB raw/weighted, ERC raw/weighted/per-layer, total loss, completed optimizer step,
+effective targets, pre-clip norm and LR used/next. Logs contain no tensors or
+autograd graphs. Global step in the input is the count **before** this update;
+the returned `global_optimizer_step` is that count plus one. Input-token counters
+and sampler position remain owned by the existing loop.
+
+BF16 autocast does not need a scaler. If an enabled GradScaler is supplied, every
+data loss must be backpropagated using that **same** scaler. The adapter scales
+ERC once, unscales combined gradients once, clips, then calls scaler step/update.
+Nonfinite combined gradients fail before stepping; there is no automatic retry
+or counter advancement. Do not unscale/clip/step separately around the adapter.
+
+### Checkpoint adapter scope
+
+Store `payload["erc_config"] = erc_config.to_dict()`. Before restoring training
+state, call `validate_erc_checkpoint_config(payload["erc_config"], erc_config)`.
+All fields (including algorithm version, coefficient, reduction and noise timing)
+are strict; missing/legacy/mismatched fields are rejected, not defaulted. Existing
+historical checkpoints are not modified. Record the new code commit/source
+identity separately using the existing checkpoint protections.
+
+ERC uses the default PyTorch device RNG already covered by CPU/CUDA RNG
+checkpoints, not a hidden generator. Restore RNG after model/optimizer setup and
+before the next ERC call. No new optimizer parameters or mutable ERC state are
+needed. Local tests cover config serialization/rejection and next-noise replay
+in memory; **full Colab/Drive checkpoint integration is not yet verified** and
+belongs to STEP 7.5 using the actual STEP 6.5C checkpoint implementation.
+
+```bash
+python -m unittest tests.test_erc_loss tests.test_erc_training -v
+```
+
+Integration tests use small synthetic CPU/CUDA batches, independent update
+references, unequal target counts, one/multiple microbatches, combined-gradient
+clipping, optimizer updates, CPU GradScaler and CUDA BF16 when available. They
+do not require Dolma, change the tokenizer, or run a pilot training job.
