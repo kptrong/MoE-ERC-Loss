@@ -793,3 +793,103 @@ Integration tests use small synthetic CPU/CUDA batches, independent update
 references, unequal target counts, one/multiple microbatches, combined-gradient
 clipping, optimizer updates, CPU GradScaler and CUDA BF16 when available. They
 do not require Dolma, change the tokenizer, or run a pilot training job.
+
+## STEP 8.2: shared pilot runner (local implementation)
+
+`python -m moe_erc.pilot_runner` provides one loop for `vanilla_moe`, `aoe`,
+and `vanilla_moe_erc`. No training occurs without `--run`. Core modules never
+mount Drive, download data, import Colab, or depend on notebook variables.
+
+The frozen pilot uses 97,657 manifest-ordered sequences, 50,000,384 input
+positions and 49,902,727 shifted targets. There are 3,051 full updates of 32
+sequences, then 25 sequences (12 microbatches of two and one of one). CE/LB
+backwards are weighted by actual effective targets; the existing
+`finish_optimizer_step` adds ERC once, clips once, and steps optimizer/scheduler
+once. Labels remain unshifted until model CE. AdamW parameters and moments are
+FP32, betas (0.9, 0.95), decay 0.1, foreach/fused disabled, with BF16 autocast
+and no scaler. LR **used** starts at 4e-4/64, peaks at update 64 and reaches
+4e-5 at update 3052. ERC uses the approved separate config unchanged.
+
+Modules:
+
+- `pilot_config.py`: immutable protocol, accounting, evaluation thresholds, LR.
+- `pilot_data.py`: read-only artifact/source verification and fixed-order batching.
+- `pilot_losses.py`: attached CE/LB adapter ported from notebook cell 84.
+- `pilot_eval.py`: full validation CE/PPL and isolated fixed-probe diagnostics.
+- `pilot_metrics.py`: graph-free, append-only JSONL session segments.
+- `pilot_checkpoint_core.py`: exact-state/RNG/checksum primitives extracted from
+  the supplied PASS notebook, cell 89 (`C65_UTILITIES`); provenance hashes are
+  recorded in the module. Snapshot synchronization is generalized for CPU tests.
+- `pilot_checkpoint.py`: the same `step65c-v1` envelope, atomic staging,
+  SHA-256/read-back and exact immediate restore checks; pilot-sized cursor and
+  evaluation validation replace smoke-specific bounds.
+- `pilot_runner.py`: shared loop and explicit launch/resume CLI.
+- `tests/test_pilot.py`: tiny synthetic fixtures including fresh Python processes.
+
+The reviewed notebook is `notebooks/MoE_+_ERC_Loss_training (1).ipynb`, cells
+83–91 and 94–97. Embedded worker source was available; the notebook is not
+executed, edited or needed at runtime. Smoke checkpoints are rejected as pilot
+inputs: pilot identities include actual training Git commit, source file hashes,
+method, full model/training/ERC configs, initial parameter hash, artifact hashes,
+run ID and runtime. The historical dataset creation commit and the narrowly
+approved `model.py` initialization fix remain data-compatibility identities,
+not the current training commit. Official launches require committed clean
+tracked source and no untracked package files. This command never commits.
+
+With existing verified artifacts restored and Drive already mounted, preflight:
+
+```bash
+python -m moe_erc.pilot_runner --method vanilla_moe \
+  --dataset /content/moe-erc/data/tokenized_datasets/dolma55m-mixed512-2b7fb5b510874ad9 \
+  --tokenizer /content/moe-erc/data/tokenizers/dolma-bpe16k-2412fe19bc1a0d22/tokenizer.json
+```
+
+An operational smoke launch in Step 8.3 adds `--run --max-updates 2`,
+`--output-root /content/moe-erc/runs` and
+`--drive-root /content/drive/MyDrive/MoE_ERC`. Production requires an A100/BF16.
+Omitting `--max-updates` with `--run` explicitly requests the full pilot.
+`--recovery-interval N` optionally saves extra optimizer-boundary checkpoints.
+Use the identical method/artifact/root arguments with `--run --resume
+/path/to/Drive/receipts/step....json` in a **new Python process** after runtime
+reset; do not pass model objects from a notebook. The runner reconstructs all
+objects, verifies identity and all saved states exactly, restores RNG last, then
+continues at the committed manifest cursor. A mid-accumulation interruption
+returns to the last completed checkpoint; partial gradients are never saved.
+
+Full validation visits all 1,006 sequences (514,066 targets), CE only, at zero,
+5M through 45M and final 50,000,384 positions, on the first eligible optimizer
+boundary. RNG and individual module mode flags are restored. The first 32
+manifest IDs form the same diagnostic probe for all methods. Full token-level
+probabilities determine entropy; routing frequencies, utilization and load CV
+are logged. Vanilla/ERC also log per-layer ERC, off-diagonal row/column violation
+rates and epsilon statistics using an isolated seed 10042. This diagnostic noise
+does not consume training RNG and is separate from the once-per-update ERC.
+Validation, diagnostic and checkpoint overheads are logged separately from
+optimizer-update time; throughput uses input-token positions.
+
+Checkpoints and logs live under `pilot/<source>/<method>/seed-42/<run-id>/`.
+Every evaluation (including zero and final) produces a checkpoint. Existing
+checkpoints are never overwritten or deleted. Session JSONL segments have unique
+names; a resume segment names its parent receipt so abandoned post-checkpoint
+events must not be treated as committed updates. Immutable log snapshots are
+copied alongside Drive checkpoints; completed evaluation markers are persisted.
+Keep all milestones/final checkpoints and explicitly budget storage before
+launch: conservatively about 0.62 GiB/full checkpoint, roughly 7 GiB per method
+plus local copies, logs and any additional recovery checkpoints. The CLI prints
+a conservative estimate; mounted filesystem free space is **not** authoritative
+Google Drive quota. Read-back SHA-256 verifies bytes visible on the mount at
+verification time, not guaranteed completion of remote service synchronization.
+
+```bash
+python -m unittest tests.test_pilot -v
+python -m unittest discover -v
+```
+
+Local fixture tests do not establish A100 memory use, speed, mounted Drive
+behavior or CUDA deterministic replay. Real artifact verification is UNKNOWN
+when files are absent locally. Step 8.3 must verify the actual committed clone,
+restored artifacts, A100 BF16 accumulation, full validation and diagnostic costs,
+and Drive/fresh-process operational resume for all three methods before a full
+pilot. No tokenizer/dataset rebuilding is needed. Exact independent CUDA replay
+remains NOT VERIFIED and is not substituted for exact immediate checkpoint
+state restoration.
