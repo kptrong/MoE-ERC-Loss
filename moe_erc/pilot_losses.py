@@ -74,12 +74,13 @@ class RoutingLossTap:
         self.scores.clear()
 
 
-def compute_data_loss(model, method, batch, config):
+def compute_data_loss(model, method, batch, config, *, dtype=None):
     """STEP 6 CE/LB semantics, shared by all methods; no ERC in this function."""
     kind = "aoe" if method == "aoe" else "vanilla_moe"
     device = model.token_embedding.weight.device
     with RoutingLossTap(model, kind) as tap:
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=config.bf16):
+        with torch.autocast(device_type=device.type, dtype=dtype or torch.bfloat16,
+                            enabled=config.bf16 or dtype is not None):
             output = model(**batch, return_routing_info=True)
         raw = tap.raw_loss(output.routing_info)
     weighted = config.lb_coefficient * raw

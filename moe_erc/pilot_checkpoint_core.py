@@ -124,7 +124,7 @@ def names_by_group(model, optimizer):
     rt_require(len(flat) == len(set(flat)), "Repeated optimizer parameter.")
     return groups
 
-def snapshot(model, optimizer, scheduler, progress, sampler):
+def snapshot(model, optimizer, scheduler, progress, sampler, scaler=None):
     if next(model.parameters()).device.type == "cuda":
         torch.cuda.synchronize(next(model.parameters()).device)
     state = {
@@ -137,7 +137,7 @@ def snapshot(model, optimizer, scheduler, progress, sampler):
         "progress": copy.deepcopy(progress),
         "sampler": copy.deepcopy(sampler),
         "modes": {n: m.training for n, m in model.named_modules()},
-        "scaler": None,
+        "scaler": frozen(scaler.state_dict()) if scaler is not None else None,
     }
     no_alias(model.state_dict(), state["model"])
     no_alias(optimizer.state_dict(), state["optimizer"])
@@ -150,7 +150,10 @@ def validate_payload(payload, identity):
     rt_require(payload["identity"] == identity, "IDENTITY_MISMATCH")
     rt_require(isinstance(payload["state"], dict)
                and set(payload["state"]) == STATE_FIELDS, "STATE_FIELDS")
-    rt_require(payload["state"]["scaler"] is None, "Unexpected scaler.")
+    if identity.get("precision") == "fp16-full55m-v1":
+        rt_require(isinstance(payload["state"]["scaler"], dict), "Missing scaler.")
+    else:
+        rt_require(payload["state"]["scaler"] is None, "Unexpected scaler.")
 
 def file_check(path, expected_sha):
     p = Path(path)

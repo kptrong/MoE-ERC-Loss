@@ -75,14 +75,15 @@ def copy_verified(source, target):
 
 
 class CheckpointManager:
-    def __init__(self, local_root, drive_root, identity, plan, guard=lambda: None):
-        self.local, self.drive = Path(local_root), Path(drive_root)
+    def __init__(self, local_root, drive_root, identity, plan, guard=lambda: None, *, scaler=None):
+        self.local, self.drive = Path(local_root), Path(drive_root) if drive_root is not None else None
+        self.scaler = scaler
         self.identity, self.plan, self.guard = copy.deepcopy(identity), plan, guard
-        core.rt_require(self.local.resolve() != self.drive.resolve(), "persistence paths must differ")
+        core.rt_require(self.drive is None or self.local.resolve() != self.drive.resolve(), "persistence paths must differ")
         validate_identity(identity, identity)
         core.exact(plan.config.to_dict(), identity["training"], "plan config")
         core.rt_require(identity["total_sequences"] == len(plan.indices), "plan sequence count")
-        for root in (self.local, self.drive):
+        for root in ((self.local, self.drive) if self.drive is not None else (self.local,)):
             for p in (root, *root.parents):
                 core.rt_require(not p.is_symlink(), f"symlink namespace: {p}")
             root.mkdir(parents=True, exist_ok=True)
@@ -116,7 +117,7 @@ class CheckpointManager:
         self._tying(model)
         core.rt_require(scheduler.last_epoch == progress["step"], "save scheduler boundary")
         core.rt_require(all(p.grad is None for p in model.parameters()), "unresolved gradients")
-        state = core.snapshot(model, optimizer, scheduler, progress, sampler)
+        state = core.snapshot(model, optimizer, scheduler, progress, sampler, self.scaler)
         digest = core.digest_tree(state)
         payload = {"schema": "step65c-v1", "identity": self.identity, "state": state}
         core.validate_payload(payload, self.identity)
@@ -150,6 +151,15 @@ class CheckpointManager:
         self._publish(stage, root, ms)
         core.exact(state["rng"], core.rng_get(), "save RNG side effect")
         del state, payload
+
+        if self.drive is None:
+            receipt = {"path": str(root.resolve()), "manifest_sha256": ms,
+                       "payload_sha256": manifest["payload"]["sha256"], "reason": reason,
+                       "step": progress["step"], "input_tokens": progress["input_tokens"]}
+            directory = self.local / "receipts"
+            directory.mkdir(exist_ok=True)
+            core.write_json(directory / f"{name}.json", receipt)
+            return receipt
 
         # Same staged/read-back Drive copy protocol as notebook cell 90.
         destination = self.drive / "checkpoints" / name
@@ -199,6 +209,8 @@ class CheckpointManager:
                     if isinstance(value, torch.Tensor):
                         optimizer.state[p][key] = value.to("cpu" if key == "step" else p.device)
         scheduler.load_state_dict(payload["state"]["scheduler"])
+        if self.scaler is not None:
+            self.scaler.load_state_dict(payload["state"]["scaler"])
         modules = dict(model.named_modules())
         core.rt_require(modules.keys() == reference["modes"].keys(), "module modes")
         for name, flag in reference["modes"].items():
@@ -206,7 +218,7 @@ class CheckpointManager:
         progress, sampler = copy.deepcopy(reference["progress"]), copy.deepcopy(reference["sampler"])
         self._tying(model)
         core.rng_set(reference["rng"])
-        actual = core.snapshot(model, optimizer, scheduler, progress, sampler)
+        actual = core.snapshot(model, optimizer, scheduler, progress, sampler, self.scaler)
         core.no_alias(reference, actual)
         self.last_equality = {}
         for key in sorted(core.STATE_FIELDS):
@@ -220,6 +232,8 @@ class CheckpointManager:
     def publish_log(self, path):
         """Immutable log snapshots; resume starts a new local session segment."""
         path = Path(path)
+        if self.drive is None:
+            return path
         target = self.drive / "logs" / f"{path.stem}-{file_sha256(path)[:16]}{path.suffix}"
         if target.exists():
             core.rt_require(file_sha256(target) == file_sha256(path), "log snapshot collision")

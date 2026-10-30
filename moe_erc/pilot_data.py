@@ -73,7 +73,7 @@ class PilotArtifacts:
             require(file_sha256(name) == expected, f"protected artifact changed: {name}")
 
 
-def load_pilot_artifacts(root, tokenizer_path, config=PilotConfig()):
+def load_pilot_artifacts(root, tokenizer_path, config=PilotConfig(), *, full_training=False):
     root, tokenizer_path = Path(root), Path(tokenizer_path)
     tokenizer_path = safe_file(tokenizer_path.parent, tokenizer_path.name)
     require(file_sha256(tokenizer_path) == TOKENIZER_SHA, "tokenizer SHA mismatch")
@@ -132,6 +132,24 @@ def load_pilot_artifacts(root, tokenizer_path, config=PilotConfig()):
     require(file_sha256(safe_file(root, "tokenizer/tokenizer.json")) == TOKENIZER_SHA
             and file_sha256(safe_file(root, "tokenizer/tokenizer.meta.json"))
                 == file_sha256(tokenizer_path.with_suffix(".meta.json")), "bundled tokenizer mismatch")
+    if full_training:
+        from .data_processing import audit_document_splits
+        require(audit_document_splits(root)["overlap"] == 0, "train/validation document overlap")
+        import hashlib as _hashlib
+        indices = np.random.Generator(np.random.PCG64(config.seed)).permutation(107478).astype("<i8")
+        index_sha = _hashlib.sha256(indices.tobytes()).hexdigest()
+        full = {"schema": "full55m-v1", "seed": config.seed,
+                "ordering": "PCG64(seed).permutation(107478)", "sequences": 107478,
+                "input_positions": 55028736, "effective_targets": 54921258,
+                "index_bytes_sha256": index_sha, "dataset_manifest_sha256": file_sha256(manifest_path),
+                "dataset_fp": DATASET_FP, "tokenizer_sha256": TOKENIZER_SHA}
+        fingerprint = _hashlib.sha256(json.dumps(full, sort_keys=True).encode()).hexdigest()
+        for p in (tokenizer_path, tokenizer_path.with_suffix(".meta.json"), manifest_path, root / "COMPLETE.json"):
+            checksums[str(p)] = file_sha256(p)
+        return PilotArtifacts(root, tokenizer_path, PilotPlan(tuple(map(int, indices)), config),
+                {"dataset_fp": DATASET_FP, "tokenizer_sha256": TOKENIZER_SHA,
+                 "pilot_manifest_sha256": fingerprint, "pilot_index_sha256": index_sha,
+                 "training_manifest": full, "creation_commit": creation}, checksums)
     pilot_path = safe_file(root, "pilot_50m_manifest.json")
     require(file_sha256(pilot_path) == PILOT_SHA
             == safe_file(root, "pilot_50m_manifest.sha256").read_text().strip(), "pilot SHA")

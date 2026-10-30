@@ -30,7 +30,7 @@ def to_device(batch, device):
     return {name: value.to(device) for name, value in batch.items()}
 
 
-def validate(model, dataset, config):
+def validate(model, dataset, config, *, dtype=None):
     """All records, CE only; model performs the sole next-token shift."""
     started = time.perf_counter()
     device = model.token_embedding.weight.device
@@ -39,7 +39,8 @@ def validate(model, dataset, config):
         for batch in microbatches(dataset, range(len(dataset)), config.validation_microbatch_size):
             batch = to_device(batch, device)
             q = int((batch["labels"][:, 1:] != -100).sum())
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=config.bf16):
+            with torch.autocast(device_type=device.type, dtype=dtype or torch.bfloat16,
+                                enabled=config.bf16 or dtype is not None):
                 output = model(**batch)
             require(bool(torch.isfinite(output.loss)), "nonfinite validation CE")
             numerator += float(output.loss) * q
