@@ -101,11 +101,13 @@ class FullRunner(PilotRunner):
         # Current run only: retain two verified recovery heads and final.
         root = self.manager.local / "checkpoints"
         paths = sorted([p for p in root.iterdir() if p.is_dir() and (p / "COMPLETE.json").exists()],
-                       key=lambda p: p.name, reverse=True)
+                       key=lambda p: (int(p.name[4:10]), p.stat().st_mtime_ns), reverse=True)
+        current = Path(receipt["path"])
+        paths = [current] + [p for p in paths if p != current]
         for p in paths[:2]:
             core.verify(p, self.manager.identity, (p / "manifest.sha256").read_text().strip())
         for p in paths[2:]:
-            if "tokens055028736" in p.name:
+            if "tokens055028736" in p.name and not any("tokens055028736" in q.name for q in paths[:2]):
                 continue
             require(p.parent == root and not p.is_symlink(), "unsafe retention path")
             m = core.verify(p, self.manager.identity, (p / "manifest.sha256").read_text().strip())
@@ -184,12 +186,27 @@ def worker(settings, method, deadline):
                 try:
                     ms = (p.parent / "manifest.sha256").read_text().strip()
                     core.verify(p.parent, identity, ms)
+                    rp = p.parents[2] / "receipts" / (p.parent.name + ".json")
+                    rec = read_json(rp) if rp.exists() else {}
+                    reason = rec.get("reason") if rec.get("manifest_sha256") == ms else None
+                    priority = {"session-end": 3, "benchmark": 2, "validation": 1}.get(reason, 0)
                     valid.append({"path": str(p.parent), "manifest_sha256": ms,
-                                  "step": int(p.parent.name[4:10])})
+                                  "step": int(p.parent.name[4:10]), "priority": priority})
                 except Exception as exc:
                     print("Rejected checkpoint:", p, str(exc), flush=True)
         require(not matched or valid, "No valid matching checkpoint; refusing fresh restart")
-        receipt = max(valid, key=lambda r:r["step"]) if valid else None
+        receipt = max(valid, key=lambda r:(r["step"],r["priority"])) if valid else None
+        if receipt:
+            from .pilot_checkpoint import copy_verified
+            old = Path(receipt["path"]).parents[3] / "benchmarks" / method
+            if old.is_dir() and old.resolve() != (out / "benchmarks" / method).resolve():
+                for p in old.rglob("*.json"):
+                    require(not p.is_symlink(), "unsafe benchmark metadata")
+                    target = out / "benchmarks" / method / p.relative_to(old)
+                    if target.exists():
+                        require(file_sha256(target) == file_sha256(p), "benchmark metadata conflict")
+                    else:
+                        copy_verified(p,target)
         tokenizer = FrozenTokenizer(settings["tokenizer"])
         r = FullRunner(model,opt,sched,PackedTokenDataset(settings["dataset"],"train",tokenizer=tokenizer),
                        PackedTokenDataset(settings["dataset"],"validation",tokenizer=tokenizer),assets.plan,
