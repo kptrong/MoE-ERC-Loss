@@ -13,6 +13,8 @@ from .pilot_losses import compute_data_loss
 from .pilot_runner import PilotRunner, initialize, make_identity, source_identity
 from .pilot_checkpoint import CheckpointManager
 from .tokenizer_utils import FrozenTokenizer
+from .full_storage import (CHECKPOINT_RESERVE_BYTES, OUTPUT_BUDGET_BYTES,
+                           check_budget, checkpoint_lock, retain_two)
 
 class StateBundle:
     def __init__(self, amp):
@@ -24,8 +26,10 @@ class StateBundle:
         self.history = copy.deepcopy(state["history"])
 
 class FullRunner(PilotRunner):
-    def __init__(self, *args, amp, bundle, tokenizer, output, **kwargs):
+    def __init__(self, *args, amp, bundle, tokenizer, output, working_root=None,
+                 output_limit_bytes=OUTPUT_BUDGET_BYTES, **kwargs):
         self.amp, self.bundle, self.tokenizer, self.output = amp, bundle, tokenizer, Path(output)
+        self.working_root, self.output_limit_bytes = working_root, output_limit_bytes
         super().__init__(*args, **kwargs)
         self.old_history = copy.deepcopy(bundle.history)
     def events(self):
@@ -93,31 +97,26 @@ class FullRunner(PilotRunner):
             print(json.dumps(row), flush=True)
         return row
     def save(self, reason="recovery"):
+        # Serialize BOTH GPU workers' staging writes and retention. Never remove
+        # old states to make room before the replacement has been verified.
+        with checkpoint_lock(self.output):
+            if self.working_root is not None:
+                reserve = max(CHECKPOINT_RESERVE_BYTES,
+                              sum(p.numel() for p in self.model.parameters()) * 20 + 128 * 1024**2)
+                check_budget(self.working_root, reserve=reserve, limit=self.output_limit_bytes)
+            return self._save_verified(reason)
+
+    def _save_verified(self, reason):
         self.bundle.history = self.events()
         receipt = super().save(reason)
         logs = self.output / "logs" / self.method
         logs.mkdir(parents=True, exist_ok=True)
         (logs / "events.json").write_text(json.dumps(self.events()), encoding="utf-8")
-        # Current run only: retain two verified recovery heads and final.
-        root = self.manager.local / "checkpoints"
-        paths = sorted([p for p in root.iterdir() if p.is_dir() and (p / "COMPLETE.json").exists()],
-                       key=lambda p: (int(p.name[4:10]), p.stat().st_mtime_ns), reverse=True)
-        current = Path(receipt["path"])
-        paths = [current] + [p for p in paths if p != current]
-        for p in paths[:2]:
-            core.verify(p, self.manager.identity, (p / "manifest.sha256").read_text().strip())
-        for p in paths[2:]:
-            if "tokens055028736" in p.name and not any("tokens055028736" in q.name for q in paths[:2]):
-                continue
-            require(p.parent == root and not p.is_symlink(), "unsafe retention path")
-            m = core.verify(p, self.manager.identity, (p / "manifest.sha256").read_text().strip())
-            archive = self.output / "logs" / self.method / "retired" / p.name
-            archive.mkdir(parents=True, exist_ok=True)
-            for name in ("manifest.json", "manifest.sha256", "COMPLETE.json"):
-                (archive / name).write_bytes((p / name).read_bytes())
-            for name in ("checkpoint.pt", "manifest.json", "manifest.sha256", "COMPLETE.json"):
-                (p / name).unlink()
-            p.rmdir()
+        audit = retain_two(self.manager, receipt, logs / "retired")
+        audit["replacement"] = receipt
+        if self.working_root is not None:
+            audit["storage"] = check_budget(self.working_root, limit=self.output_limit_bytes)
+        core.write_json(logs / ("retention-" + Path(receipt["path"]).name + ".json"), audit)
         return receipt
     def evaluate_due(self):
         due = [m for m in self.plan.milestones if m <= self.progress["input_tokens"]
@@ -210,14 +209,22 @@ def worker(settings, method, deadline):
         tokenizer = FrozenTokenizer(settings["tokenizer"])
         r = FullRunner(model,opt,sched,PackedTokenDataset(settings["dataset"],"train",tokenizer=tokenizer),
                        PackedTokenDataset(settings["dataset"],"validation",tokenizer=tokenizer),assets.plan,
-                       manager,receipt,amp=amp,bundle=bundle,tokenizer=tokenizer,output=out)
+                       manager,receipt,amp=amp,bundle=bundle,tokenizer=tokenizer,output=out,
+                       working_root=settings.get("working_root"),
+                       output_limit_bytes=settings.get("output_limit_bytes", OUTPUT_BUDGET_BYTES))
+        if receipt:
+            print(json.dumps({"event": "restore", "method": method,
+                              "immediate_state_equality": manager.last_equality,
+                              "step": r.progress["step"], "input_tokens": r.progress["input_tokens"],
+                              "sampler_cursor": r.sampler["cursor"], "checkpoint": receipt["path"]}),
+                  flush=True)
         stopped = []
         signal.signal(signal.SIGTERM, lambda *_: stopped.append(True))
         r.evaluate_due()
         while r.progress["step"] < 3359 and time.time() < deadline and not stopped:
             r.update(); r.evaluate_due()
-            if r.progress["step"] % 100 == 0:
-                r.save()
+            # evaluate_due() already saves at every ~5M-token milestone and the
+            # endpoint, plus before/after benchmarks. No extra 100-update saves.
         r.save("session-end")
         report.update(status="COMPLETED" if r.progress["step"] == 3359 else "INCOMPLETE",
                       progress=r.progress, initial_hash=initial, receipt=r.last_receipt)

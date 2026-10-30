@@ -32,6 +32,8 @@ SOURCE_COMMIT="{head}"
 SOURCE=Path("/kaggle/working/moe_erc_source")
 INPUT=Path("/kaggle/input")
 OUTPUT=Path("/kaggle/working/moe_erc_training")
+WORKING=Path("/kaggle/working")
+OUTPUT_LIMIT_BYTES=18_000_000_000 # Safety margin below Kaggle's 20 GB saved-output cap.
 DATASET_DIR=None # Optional explicit directory containing dataset_manifest.json.
 TOKENIZER_PATH=None # Default: dataset/tokenizer/tokenizer.json
 RESUME_ROOTS=[str(INPUT)] # Attach saved output from previous session.
@@ -41,6 +43,11 @@ OUTPUT.mkdir(parents=True,exist_ok=True)
 ''')
     md("## 2 SETUP — exact source commit và dependencies")
     code(f'''from importlib.metadata import version
+# Download/evaluation caches are disposable and must not become saved output.
+CACHE=Path("/tmp/moe-erc-cache")
+for key,folder in {{"HF_HOME":"hf","HF_DATASETS_CACHE":"datasets",
+                   "HF_HUB_CACHE":"hub","PIP_CACHE_DIR":"pip","MPLCONFIGDIR":"mpl"}}.items():
+    os.environ[key]=str(CACHE/folder)
 if any(k=="moe_erc" or k.startswith("moe_erc.") for k in sys.modules):
     raise RuntimeError("Restart kernel before SETUP; resume from saved output.")
 constraint=OUTPUT/"torch-constraint.txt"
@@ -91,7 +98,8 @@ else:np.save(indices,np.asarray(assets.plan.indices,dtype="<i8"),allow_pickle=Fa
 indices.with_suffix(".sha256").write_text(file_sha256(indices)+"\\n")
 SETTINGS=OUTPUT/"settings.json"
 SETTINGS.write_text(json.dumps({"source":str(SOURCE),"output":str(OUTPUT),
-    "dataset":str(DATASET_DIR),"tokenizer":str(TOKENIZER_PATH),"resume_roots":RESUME_ROOTS}))
+    "dataset":str(DATASET_DIR),"tokenizer":str(TOKENIZER_PATH),"resume_roots":RESUME_ROOTS,
+    "working_root":str(WORKING),"output_limit_bytes":OUTPUT_LIMIT_BYTES}))
 print(assets.identity["training_manifest"])
 ''')
     md("## 4 GPU — independent FP16 workers")
@@ -101,9 +109,16 @@ N_GPU=torch.cuda.device_count()
 for i in range(N_GPU):print(i,torch.cuda.get_device_name(i),torch.cuda.get_device_properties(i).total_memory/1024**3,"GiB")
 LANES=[(0,["vanilla_moe","vanilla_moe_erc"]),(1,["aoe"])] if N_GPU>=2 else [(0,["vanilla_moe","aoe","vanilla_moe_erc"])]
 print(LANES)
+from moe_erc.full_storage import check_budget,CHECKPOINT_RESERVE_BYTES
+# Six retained full states (2/model) + one serialized staging writer + logs margin.
+print("Storage preflight:",check_budget(WORKING,reserve=7*CHECKPOINT_RESERVE_BYTES+512*1024**2,
+                                       limit=OUTPUT_LIMIT_BYTES))
+print("Checkpoint policy: ~5M tokens + final/session end; two verified heads/model.")
 ''')
     md("## 5 TRAIN + EVALUATE — full target, không simulation")
-    code('''deadline=time.time()+SESSION_HOURS*3600
+    code('''print("Cell 5 storage check:",check_budget(WORKING,reserve=CHECKPOINT_RESERVE_BYTES+256*1024**2,
+                                                  limit=OUTPUT_LIMIT_BYTES))
+deadline=time.time()+SESSION_HOURS*3600
 def lane(gpu,methods):
     results=[]
     for method in methods:
@@ -149,15 +164,40 @@ print("Kaggle completion:",len(rs)==3 and all(r["status"]=="COMPLETED" for r in 
 from IPython.display import Image
 for p in render(OUTPUT):display(Image(filename=str(p)))
 ''')
-    md("""## 8 EXPORT / RESUME
-Save actual Notebook Version **with output**, then confirm checkpoint/log files appear
-in Output; or download all checkpoint files below and verify SHA. Attach the saved
-output as Input next session, keep source commit/runtime, and Run All: each model
-finds its own latest valid checkpoint. No automatic durable upload is claimed.
-`/kaggle/working` alone is not a backup. Multiple sessions may be needed.
+    md("""## 8 EXPORT / RESUME — Windows và Private Kaggle Dataset
+Chờ Cell 5 kết thúc sạch (COMPLETED hoặc INCOMPLETE), chạy Cells 6–8. Save Version
+có output và xác nhận các file xuất hiện ở Output; tải **toàn bộ output** từ tab
+Output, hoặc CLI Windows: `kaggle kernels output OWNER/NOTEBOOK-SLUG -p D:\\MoE_Backups\\session-01`.
+Notebook `.ipynb` tải riêng không chứa checkpoint. Không download vào thư mục backup cũ.
+Xác minh SHA-256 theo `export-*.json` và `.sha256` trước khi tin bản tải về (xem FULL55M.md).
+
+Để resume: Kaggle → Datasets → New Dataset → upload thư mục `moe_erc_training`
+đã tải (giữ nguyên cấu trúc, không chỉ checkpoint.pt), chọn **Private**. Giữ logs,
+benchmarks, receipts, run-identity, training manifest và cả bốn file trong mỗi checkpoint.
+Add Input dataset private này cùng dataset/tokenizer gốc vào notebook **này**.
+Giữ SOURCE_COMMIT và runtime dependencies, restart kernel rồi chạy Cells 1–5.
+`RESUME_ROOTS=["/kaggle/input"]` tự tìm từng model, kiểm tra identity/checksum,
+restore chính xác trước update tiếp theo. Xem log restore và step/cursor; lỗi identity
+phải dừng, không xóa checkpoint hay bỏ kiểm tra. Input được đọc trực tiếp, không copy .pt vào working.
+Giữ cả hai checkpoint gần nhất/model, bản cuối nằm trong hai bản này (không phải bản thứ ba).
+Cache benchmark nằm ở `/tmp`; storage guard áp trần 18 GB cho toàn working, khóa staging
+giữa hai GPU, chừa dung lượng trước save. Không tự xóa logs, dữ liệu lạ hay save dở.
+`/kaggle/working` chưa được lưu/download không phải backup. Có thể cần nhiều sessions.
 Harness task docs: https://github.com/EleutherAI/lm-evaluation-harness/tree/v0.4.9/lm_eval/tasks
 """)
-    code('''files=[]
+    code('''print("Final output storage:",check_budget(WORKING,limit=OUTPUT_LIMIT_BYTES))
+from moe_erc import pilot_checkpoint_core as checkpoint_core
+for method in ("vanilla_moe","aoe","vanilla_moe_erc"):
+    root=OUTPUT/"checkpoints"/method/"checkpoints"
+    verified=[]
+    for p in sorted(root.glob("step*")):
+        if p.is_dir() and (p/"COMPLETE.json").exists():
+            identity=json.loads((p/"manifest.json").read_text())["identity"]
+            checkpoint_core.verify(p,identity,(p/"manifest.sha256").read_text().strip())
+            verified.append(p.name)
+    assert len(verified)<=2,f"Unexpected retention count for {method}: {verified}"
+    print(method,"verified retained checkpoints:",verified)
+files=[]
 for p in sorted(OUTPUT.rglob("*")):
     if p.is_file() and not p.name.startswith("export-") and ".partial" not in p.name:
         files.append({"path":p.relative_to(OUTPUT).as_posix(),"bytes":p.stat().st_size,"sha256":file_sha256(p)})
