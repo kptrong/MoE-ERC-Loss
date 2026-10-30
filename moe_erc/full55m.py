@@ -151,6 +151,7 @@ def worker(settings, method, deadline):
     report = {"method": method, "status": "FAILED"}
     try:
         require(torch.cuda.device_count() == 1, "Worker must see one GPU")
+        torch.set_num_threads(2)
         cfg = PilotConfig(bf16=False)
         assets = load_pilot_artifacts(settings["dataset"], settings["tokenizer"], cfg, full_training=True)
         require(assets.plan.total_updates == 3359, "full horizon")
@@ -160,7 +161,10 @@ def worker(settings, method, deadline):
         identity = make_identity(method, model, assets.plan, assets.identity, source,
                                  "full55m-fp16-v1-" + method, initial)
         identity["precision"] = "fp16-full55m-v1"
-        amp = torch.amp.GradScaler("cuda")
+        try:
+            amp = torch.amp.GradScaler("cuda")
+        except (AttributeError, TypeError):
+            amp = torch.cuda.amp.GradScaler()
         bundle = StateBundle(amp)
         def guard():
             core.exact(source_identity(settings["source"]), source)
